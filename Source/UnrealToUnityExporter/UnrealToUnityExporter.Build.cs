@@ -47,6 +47,7 @@ public class UnrealToUnityExporter : ModuleRules
 				"JsonUtilities",
 				"Networking",
 				"Sockets",
+				"InputCore",
 			}
 			);
 		

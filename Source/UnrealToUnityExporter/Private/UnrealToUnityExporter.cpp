@@ -12,25 +12,13 @@
 #include "MeshMergeModule.h"
 #include "PackageTools.h"
 #include "ScopedTransaction.h"
+#include "SExportSettingsWindow.h"
 #include "Sockets.h"
 #include "ToolMenus.h"
 #include "UnrealToUnityExporterStaticMeshAdapter.h"
-#include "Algo/RemoveIf.h"
 #include "Common/TcpSocketBuilder.h"
 
 #define LOCTEXT_NAMESPACE "FUnrealToUnityExporterModule"
-
-namespace
-{
-	const TArray<FName> TextureMaterialParameterNames =
-	{
-		TEXT("BaseColorTexture"),
-		TEXT("MetallicTexture"),
-		TEXT("NormalTexture"),
-		TEXT("RoughnessTexture"),
-		TEXT("EmissiveTexture"),
-	};
-}
 
 void FUnrealToUnityExporterModule::StartupModule()
 {
@@ -63,37 +51,48 @@ void FUnrealToUnityExporterModule::RunUnrealToUnityExporter()
 		return Cast<UStaticMesh>(AssetData.GetAsset());
 	});
 
+	TSharedRef<SExportSettingsWindow> ExportSettingsWindow = SNew(SExportSettingsWindow);
+	FSlateApplication::Get().AddModalWindow(ExportSettingsWindow, nullptr);
+
+	const FExportSettings& ExportSettings = ExportSettingsWindow->GetExportSettings();
+	
+	if (ExportSettings.bCanceled)
+	{
+		return;
+	}
+
 	const FString RelativeExportDirectory = FPaths::ProjectSavedDir() / TEXT("UnrealToUnityExporter");
 	const FString ExportDirectory = IFileManager::Get().ConvertToAbsolutePathForExternalAppForWrite(*RelativeExportDirectory);
 
-	FUnrealToUnityExporterMeshImportDescriptor MeshImportDescriptor;
-	MeshImportDescriptor.ExportDirectory = ExportDirectory;
+	FUnrealToUnityExporterImportDescriptor ImportDescriptor;
+	ImportDescriptor.ExportDirectory = ExportDirectory;
 
 	FScopedSlowTask SlowTask(5, LOCTEXT("BakeOutStaticMeshesSlowTask", "Baking out meshes"));
 	SlowTask.MakeDialog();
 
+	TMap<FName, UMaterialInterface*> OriginalPathsToMaterial;
+	
 	SlowTask.EnterProgressFrame(1.f);
-	BakeOutStaticMeshes(StaticMeshes);
-
-	SlowTask.EnterProgressFrame(1.f, LOCTEXT("SetMaterialNamesSlowTask", "Setting material names"));
-	SetMaterialNames(StaticMeshes);
+	BakeOutStaticMeshes(StaticMeshes, OriginalPathsToMaterial, ExportSettings);
 
 	SlowTask.EnterProgressFrame(1.f, LOCTEXT("ExportMeshesSlowTask", "Exporting meshes"));
-	ExportMeshes(StaticMeshes, ExportDirectory);
+	ExportMeshes(StaticMeshes, ExportDirectory, ImportDescriptor, ExportSettings);
 
-	SlowTask.EnterProgressFrame(1.f, LOCTEXT("ExportTexturesSlowTask", "Exporting textures"));
-	ExportTextures(StaticMeshes, ExportDirectory, MeshImportDescriptor);
+	SlowTask.EnterProgressFrame(1.f, LOCTEXT("ExportMaterialsSlowTask", "Exporting materials"));
+	ExportMaterials(OriginalPathsToMaterial, ExportDirectory, ImportDescriptor);
 
 	SlowTask.EnterProgressFrame(1.f, LOCTEXT("RevertMeshesSlowTask", "Reverting mesh changes"));
-	RevertStaticMeshChanges(StaticMeshes);
+	TArray<UMaterialInterface*> GeneratedMaterials;
+	OriginalPathsToMaterial.GenerateValueArray(GeneratedMaterials);
+	RevertChanges(StaticMeshes, GeneratedMaterials);
 
-	SlowTask.EnterProgressFrame(1.f, LOCTEXT("SaveMeshImportDescriptorSlowTask", "Saving mesh import descriptor"));
-	const FString MeshImportDescriptorSavePath = SaveMeshImportDescriptor(MeshImportDescriptor, ExportDirectory);
+	SlowTask.EnterProgressFrame(1.f, LOCTEXT("SaveImportDescriptorSlowTask", "Saving mesh import descriptor"));
+	const FString ImportDescriptorSavePath = SaveImportDescriptor(ImportDescriptor, ExportDirectory);
 
-	SendUnityImportMessage(MeshImportDescriptorSavePath);
+	SendUnityImportMessage(ImportDescriptorSavePath);
 }
 
-void FUnrealToUnityExporterModule::BakeOutStaticMeshes(const TArrayView<UStaticMesh*> StaticMeshes)
+void FUnrealToUnityExporterModule::BakeOutStaticMeshes(const TArrayView<UStaticMesh*> StaticMeshes, TMap<FName, UMaterialInterface*>& OriginalPathsToMaterial, const FExportSettings& ExportSettings)
 {
 	const IMeshMergeUtilities& MeshMergeUtilities = FModuleManager::Get().LoadModuleChecked<IMeshMergeModule>("MeshMergeUtilities").GetUtilities();
 	
@@ -105,9 +104,13 @@ void FUnrealToUnityExporterModule::BakeOutStaticMeshes(const TArrayView<UStaticM
 		UAssetBakeOptions* AssetOptions = GetMutableDefault<UAssetBakeOptions>();
 		UMaterialMergeOptions* MergeOptions = GetMutableDefault<UMaterialMergeOptions>();
 		TArray<TWeakObjectPtr<>> Objects{ MergeOptions, AssetOptions, MaterialOptions };
-			
-		MaterialOptions->LODIndices = { 0 };
-		MaterialOptions->TextureSize = FIntPoint(2048, 2048);
+
+		for (int32 LodIndex = 0; LodIndex < StaticMesh->GetNumLODs(); LodIndex++)
+		{
+			MaterialOptions->LODIndices.Add(LodIndex);	
+		}
+		
+		MaterialOptions->TextureSize = FIntPoint(ExportSettings.TextureSize, ExportSettings.TextureSize);
 		MaterialOptions->Properties.Empty();
 			
 		MaterialOptions->Properties.Emplace(MP_BaseColor);
@@ -117,55 +120,73 @@ void FUnrealToUnityExporterModule::BakeOutStaticMeshes(const TArrayView<UStaticM
 		MaterialOptions->Properties.Emplace(MP_Normal);
 		MaterialOptions->Properties.Emplace(MP_Opacity);
 		MaterialOptions->Properties.Emplace(MP_EmissiveColor);
+
+		TMap<int32, FName> LodSectionHashToMaterialPath;
+
+		auto GetHashFromLodSection = [](int32 LodIndex, int32 SectionIndex) -> int32
+		{
+			return LodIndex * 10000 + SectionIndex;
+		};
+
+		{
+			const int32 LodCount = StaticMesh->GetNumLODs();
 			
+			for (int32 LodIndex = 0; LodIndex < LodCount; LodIndex++)
+			{
+				const int32 SectionCount = StaticMesh->GetNumSections(LodIndex);
+
+				for (int32 SectionIndex = 0; SectionIndex < SectionCount; SectionIndex++)
+				{
+					const FMeshSectionInfo& SectionInfo = StaticMesh->GetSectionInfoMap().Get(LodIndex, SectionIndex);
+					const int32 MaterialIndex = SectionInfo.MaterialIndex;
+					const FName MaterialPath = StaticMesh->GetMaterial(MaterialIndex)->GetPackage()->GetFName();
+					LodSectionHashToMaterialPath.Add(GetHashFromLodSection(LodIndex, SectionIndex), MaterialPath);
+				}
+			}
+		}
+		
 		// Bake out materials for static mesh asset
 		StaticMesh->Modify();
 		FUnrealToUnityExporterStaticMeshAdapter Adapter(StaticMesh);
 		MeshMergeUtilities.BakeMaterialsForComponent(Objects, &Adapter);
-	}
-}
 
-void FUnrealToUnityExporterModule::SetMaterialNames(const TArrayView<UStaticMesh*> StaticMeshes)
-{
-	for (UStaticMesh* StaticMesh : StaticMeshes)
-	{
-		TArray<FStaticMaterial> StaticMaterials = StaticMesh->GetStaticMaterials();
-
-		constexpr int32 TargetLod = 0;
-		const int32 SectionCount = StaticMesh->GetNumSections(TargetLod);
-		TArray<int32> UsedMaterialIndices;
-
-		for (int32 SectionIndex = 0; SectionIndex < SectionCount; SectionIndex++)
 		{
-			UsedMaterialIndices.AddUnique(StaticMesh->GetSectionInfoMap().Get(TargetLod, SectionIndex).MaterialIndex);
-		}
-
-		int32 RemovedMaterialCount = 0;
-		
-		for (int32 Index = 0; Index < StaticMaterials.Num(); Index++)
-		{
-			if (!UsedMaterialIndices.Contains(Index + RemovedMaterialCount))
+			TSet<int32> ProcessedMaterialIndices;
+			TArray<FStaticMaterial> StaticMaterials = StaticMesh->GetStaticMaterials();
+			const int32 LodCount = StaticMesh->GetNumLODs();
+			
+			for (int32 LodIndex = 0; LodIndex < LodCount; LodIndex++)
 			{
-				StaticMaterials.RemoveAt(Index);
-				RemovedMaterialCount++;
-				Index--;
+				const int32 SectionCount = StaticMesh->GetNumSections(LodIndex);
+
+				for (int32 SectionIndex = 0; SectionIndex < SectionCount; SectionIndex++)
+				{
+					const FMeshSectionInfo& SectionInfo = StaticMesh->GetSectionInfoMap().Get(LodIndex, SectionIndex);
+					const int32 MaterialIndex = SectionInfo.MaterialIndex;
+
+					if (ProcessedMaterialIndices.Contains(MaterialIndex))
+					{
+						continue;
+					}
+					
+					const int32 LodSectionHash = GetHashFromLodSection(LodIndex, SectionIndex);
+					const FName& OriginalMaterialPath = LodSectionHashToMaterialPath[LodSectionHash];
+					const FString OriginalMaterialPathStr = OriginalMaterialPath.ToString();
+					const FString OriginalMaterialName = FPaths::GetCleanFilename(OriginalMaterialPathStr);
+					const FString MaterialName = FString::Printf(TEXT("%s_%s"), *OriginalMaterialName, *FMD5::HashAnsiString(*OriginalMaterialPathStr));
+					StaticMaterials[MaterialIndex].MaterialInterface = DuplicateObject(StaticMaterials[MaterialIndex].MaterialInterface, nullptr, FName(MaterialName));
+
+					ProcessedMaterialIndices.Add(MaterialIndex);
+					OriginalPathsToMaterial.Add(OriginalMaterialPath, StaticMaterials[MaterialIndex].MaterialInterface);
+				}
 			}
-		}
-		
-		const FString StaticMeshName = StaticMesh->GetName();
 
-		int32 MaterialIndex = 0;
-		
-		for (FStaticMaterial& StaticMaterial : StaticMaterials)
-		{
-			StaticMaterial.MaterialInterface = DuplicateObject(StaticMaterial.MaterialInterface, nullptr, FName(FString::Printf(TEXT("%s_%d"), *StaticMeshName, MaterialIndex++)));
+			StaticMesh->SetStaticMaterials(StaticMaterials);
 		}
-
-		StaticMesh->SetStaticMaterials(StaticMaterials);
 	}
 }
 
-void FUnrealToUnityExporterModule::ExportMeshes(const TArrayView<UStaticMesh*> StaticMeshes, const FString& ExportDirectory)
+void FUnrealToUnityExporterModule::ExportMeshes(const TArrayView<UStaticMesh*> StaticMeshes, const FString& ExportDirectory, FUnrealToUnityExporterImportDescriptor& ImportDescriptor, const FExportSettings& ExportSettings)
 {
 	const FAssetToolsModule& AssetToolsModule = FModuleManager::GetModuleChecked<FAssetToolsModule>("AssetTools");
 	TArray<UObject*> Objects;
@@ -174,68 +195,74 @@ void FUnrealToUnityExporterModule::ExportMeshes(const TArrayView<UStaticMesh*> S
 		return StaticMesh;
 	});
 
-	AssetToolsModule.Get().ExportAssets(Objects, GetStaticMeshExportDirectory(ExportDirectory));
-}
+	const FString ExportFolder = TEXT("Models");
+	const FString MeshExportDirectory = ExportDirectory / ExportFolder;
+	
+	AssetToolsModule.Get().ExportAssets(Objects, MeshExportDirectory);
 
-void FUnrealToUnityExporterModule::ExportTextures(const TArrayView<UStaticMesh*> StaticMeshes, const FString& ExportDirectory, FUnrealToUnityExporterMeshImportDescriptor& MeshImportDescriptor)
-{
 	for (const UStaticMesh* StaticMesh : StaticMeshes)
 	{
-		TArray<FUnrealToUnityExporterMaterialDescriptor> MaterialDescriptors;
+		FUnrealToUnityExporterMeshDescriptor MeshDescriptor;
+		MeshDescriptor.MeshPath = ExportFolder / StaticMesh->GetPackage()->GetPathName() + TEXT(".fbx");
+		MeshDescriptor.bEnableReadWrite = ExportSettings.bEnableReadWrite;
+		ImportDescriptor.MeshDescriptors.Add(MoveTemp(MeshDescriptor));
+	}
+}
 
-		const TArray<FStaticMaterial> StaticMaterials = StaticMesh->GetStaticMaterials();
-		
-		for (const FStaticMaterial& StaticMaterial : StaticMaterials)
+void FUnrealToUnityExporterModule::ExportMaterials(const TMap<FName, UMaterialInterface*>& OriginalPathsToMaterial, const FString& ExportDirectory, FUnrealToUnityExporterImportDescriptor& ImportDescriptor)
+{
+	for (const auto& [OriginalPath, MaterialInterface] : OriginalPathsToMaterial)
+	{
+		FUnrealToUnityExporterMaterialDescriptor MaterialDescriptor;
+		const FString OriginalPathStr = FPaths::GetPath(OriginalPath.ToString()) / MaterialInterface->GetName();
+		MaterialDescriptor.MaterialPath = TEXT("Materials") / OriginalPathStr;
+		const FString ExportFolder = TEXT("Textures");
+		ExportTextures(*MaterialInterface, ExportDirectory, ExportFolder / OriginalPathStr, MaterialDescriptor);
+
+		ImportDescriptor.MaterialDescriptors.Add(MoveTemp(MaterialDescriptor));
+	}
+}
+
+void FUnrealToUnityExporterModule::ExportTextures(const UMaterialInterface& MaterialInterface, const FString& ExportDirectory, const FString& ExportFolder, FUnrealToUnityExporterMaterialDescriptor& MaterialDescriptor)
+{
+	TArray<FMaterialParameterInfo> OutParameterInfo;
+	TArray<FGuid> OutParameterIds;
+	MaterialInterface.GetAllTextureParameterInfo(OutParameterInfo, OutParameterIds);
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	
+	for (const FMaterialParameterInfo& ParameterInfo : OutParameterInfo)
+	{
+		UTexture* Texture;
+
+		if (MaterialInterface.GetTextureParameterValue(ParameterInfo, Texture, true /*bOveriddenOnly*/))
 		{
-			const FString TexturesExportDirectory = ExportDirectory / TEXT("Textures") / ConvertPathNameToDiskPathFormat(StaticMesh->GetPathName()) / StaticMaterial.MaterialInterface->GetName();
-			
-			FUnrealToUnityExporterMaterialDescriptor MaterialDescriptor;
-			MaterialDescriptor.MaterialName = StaticMaterial.MaterialInterface->GetFName();
-			UE_LOG(LogTemp, Error, TEXT("Material index isn't valid. Index: %d"), StaticMesh->GetRenderData()->LODResources[0].Sections.Num());  
-			
-			for (const FName& TextureMaterialParameterName : TextureMaterialParameterNames)
+			if (UTexture2D* Texture2D = Cast<UTexture2D>(Texture))
 			{
-				FHashedMaterialParameterInfo HashedMaterialParameterInfo;
-				HashedMaterialParameterInfo.Name = FScriptName(TextureMaterialParameterName);
-				HashedMaterialParameterInfo.Association = GlobalParameter;
-			
-				UTexture* Texture;
-
-				if (StaticMaterial.MaterialInterface->GetTextureParameterValue(HashedMaterialParameterInfo, Texture, true /*bOveriddenOnly*/))
+				FImage OutImage;
+				Texture2D->Source.GetMipImage(OutImage, 0);
+				const FString TexturePath = ExportFolder / ParameterInfo.Name.ToString() + TEXT(".png");
+				const FString ExportPath = ExportDirectory / TexturePath;
+				
+				if (FPaths::FileExists(ExportPath))
 				{
-					if (UTexture2D* Texture2D = Cast<UTexture2D>(Texture))
-					{
-						FImage OutImage;
-						Texture2D->Source.GetMipImage(OutImage, 0);
-						const FString TexturePath = (TexturesExportDirectory / TextureMaterialParameterName.ToString() + TEXT(".png"));
-						FImageUtils::SaveImageByExtension(*TexturePath, OutImage);
-
-						MaterialDescriptor.TextureNames.Add(TextureMaterialParameterName);
-						MaterialDescriptor.TexturePaths.Add(TexturePath);
-					}
+					PlatformFile.DeleteFile(*ExportPath);
 				}
-			}
+				
+				FImageUtils::SaveImageByExtension(*ExportPath, OutImage);
 
-			if (!MaterialDescriptor.TextureNames.IsEmpty())
-			{
-				MaterialDescriptors.Add(MoveTemp(MaterialDescriptor));
+				MaterialDescriptor.TextureNames.Add(ParameterInfo.Name);
+				MaterialDescriptor.TexturePaths.Add(TexturePath);
 			}
-		}
-
-		if (!MaterialDescriptors.IsEmpty())
-		{
-			const FString StaticMeshExportDirectory = GetStaticMeshPathOnDisk(ExportDirectory, StaticMesh->GetPathName());
-			MeshImportDescriptor.MeshToMaterialDescriptors.Emplace(StaticMeshExportDirectory, MoveTemp(MaterialDescriptors));
 		}
 	}
 }
 
-void FUnrealToUnityExporterModule::RevertStaticMeshChanges(const TArrayView<UStaticMesh*> StaticMeshes)
+void FUnrealToUnityExporterModule::RevertChanges(const TArrayView<UStaticMesh*> StaticMeshes, const TArrayView<UMaterialInterface*> MaterialInterfaces)
 {
 	GEditor->UndoTransaction(false /*bCanRedo*/);
 
 	TArray<UPackage*> PackagesToReload;
-	Algo::Transform(StaticMeshes, PackagesToReload, [] (UStaticMesh* StaticMesh)
+	Algo::Transform(StaticMeshes, PackagesToReload, [] (const UStaticMesh* StaticMesh)
 	{
 		return StaticMesh->GetPackage();
 	});
@@ -243,19 +270,19 @@ void FUnrealToUnityExporterModule::RevertStaticMeshChanges(const TArrayView<USta
 	UPackageTools::ReloadPackages(PackagesToReload);
 }
 
-FString FUnrealToUnityExporterModule::SaveMeshImportDescriptor(const FUnrealToUnityExporterMeshImportDescriptor& MeshImportDescriptor, const FString& ExportDirectory)
+FString FUnrealToUnityExporterModule::SaveImportDescriptor(const FUnrealToUnityExporterImportDescriptor& ImportDescriptor, const FString& ExportDirectory)
 {
-	TSharedRef<FJsonObject> JsonObject = FJsonObjectConverter::UStructToJsonObject(MeshImportDescriptor).ToSharedRef();
+	TSharedRef<FJsonObject> JsonObject = FJsonObjectConverter::UStructToJsonObject(ImportDescriptor).ToSharedRef();
 	FString JsonString;
 	const TSharedRef<TJsonWriter<>> JsonWriter = TJsonWriterFactory<>::Create(&JsonString);
 	FJsonSerializer::Serialize(JsonObject, JsonWriter, true);
-	const FString SavePath = ExportDirectory / TEXT("MeshImportDescriptor.txt");
+	const FString SavePath = ExportDirectory / TEXT("ImportDescriptor.txt");
 	FFileHelper::SaveStringToFile(JsonString, *SavePath);
 
 	return SavePath;
 }
 
-void FUnrealToUnityExporterModule::SendUnityImportMessage(const FString& MeshImportDescriptorSavePath)
+void FUnrealToUnityExporterModule::SendUnityImportMessage(const FString& ImportDescriptorSavePath)
 {
 	const FIPv4Endpoint ClientEndpoint(FIPv4Address(127, 0, 0, 1), 55720);
 	
@@ -269,10 +296,10 @@ void FUnrealToUnityExporterModule::SendUnityImportMessage(const FString& MeshImp
 	
 	FString Message = TEXT("unrealToUnityImporter?");
 
-	if (!MeshImportDescriptorSavePath.IsEmpty())
+	if (!ImportDescriptorSavePath.IsEmpty())
 	{
-		Message += TEXT("meshImportDescriptorPath=");
-		Message += MeshImportDescriptorSavePath;
+		Message += TEXT("ImportDescriptorPath=");
+		Message += ImportDescriptorSavePath;
 	}
 
 	int32 Utf8Length = FTCHARToUTF8_Convert::ConvertedLength(*Message, Message.Len());
@@ -288,21 +315,6 @@ void FUnrealToUnityExporterModule::SendUnityImportMessage(const FString& MeshImp
 
 	ISocketSubsystem& SocketSubsystem = *(ISocketSubsystem::Get());
 	SocketSubsystem.DestroySocket(Socket);
-}
-
-FString FUnrealToUnityExporterModule::ConvertPathNameToDiskPathFormat(const FString& PathName)
-{
-	return FPaths::GetPath(PathName) / FPaths::GetBaseFilename(PathName);
-}
-
-FString FUnrealToUnityExporterModule::GetStaticMeshExportDirectory(const FString& ExportDirectory)
-{
-	return ExportDirectory / TEXT("Models");
-}
-
-FString FUnrealToUnityExporterModule::GetStaticMeshPathOnDisk(const FString& ExportDirectory, const FString& StaticMeshPathName)
-{
-	return GetStaticMeshExportDirectory(ExportDirectory) / ConvertPathNameToDiskPathFormat(StaticMeshPathName) + TEXT(".fbx");
 }
 
 #undef LOCTEXT_NAMESPACE

@@ -6,13 +6,15 @@
 #include "Modules/ModuleManager.h"
 #include "UnrealToUnityExporter.generated.h"
 
+struct FExportSettings;
+
 USTRUCT()
 struct FUnrealToUnityExporterMaterialDescriptor
 {
 	GENERATED_BODY()
 
 	UPROPERTY()
-	FName MaterialName;
+	FString MaterialPath;
 	
 	UPROPERTY()
 	TArray<FName> TextureNames;
@@ -22,27 +24,30 @@ struct FUnrealToUnityExporterMaterialDescriptor
 };
 
 USTRUCT()
-struct FUnrealToUnityExporterMaterialDescriptors
+struct FUnrealToUnityExporterMeshDescriptor
 {
 	GENERATED_BODY()
 
 	UPROPERTY()
 	FString MeshPath;
-	
+
 	UPROPERTY()
-	TArray<FUnrealToUnityExporterMaterialDescriptor> MaterialDescriptors;
+	bool bEnableReadWrite = false;
 };
 
 USTRUCT()
-struct FUnrealToUnityExporterMeshImportDescriptor
+struct FUnrealToUnityExporterImportDescriptor
 {
 	GENERATED_BODY()
 
 	UPROPERTY()
 	FString ExportDirectory;
+
+	UPROPERTY()
+	TArray<FUnrealToUnityExporterMaterialDescriptor> MaterialDescriptors;
 	
 	UPROPERTY()
-	TArray<FUnrealToUnityExporterMaterialDescriptors> MeshToMaterialDescriptors;
+	TArray<FUnrealToUnityExporterMeshDescriptor> MeshDescriptors;
 };
 
 class FUnrealToUnityExporterModule : public IModuleInterface
@@ -55,15 +60,11 @@ public:
 
 private:
 	static void RunUnrealToUnityExporter();
-	static void BakeOutStaticMeshes(const TArrayView<UStaticMesh*> StaticMeshes);
-	static void SetMaterialNames(const TArrayView<UStaticMesh*> StaticMeshes);
-	static void ExportMeshes(const TArrayView<UStaticMesh*> StaticMeshes, const FString& ExportDirectory);
-	static void ExportTextures(const TArrayView<UStaticMesh*> StaticMeshes, const FString& ExportDirectory, FUnrealToUnityExporterMeshImportDescriptor& MeshImportDescriptor);
-	static void RevertStaticMeshChanges(const TArrayView<UStaticMesh*> StaticMeshes);
-	static FString SaveMeshImportDescriptor(const FUnrealToUnityExporterMeshImportDescriptor& MeshImportDescriptor, const FString& ExportDirectory);
-	static void SendUnityImportMessage(const FString& MeshImportDescriptorSavePath);
-
-	static FString ConvertPathNameToDiskPathFormat(const FString& PathName);
-	static FString GetStaticMeshExportDirectory(const FString& ExportDirectory);
-	static FString GetStaticMeshPathOnDisk(const FString& ExportDirectory, const FString& StaticMeshPathName);
+	static void BakeOutStaticMeshes(const TArrayView<UStaticMesh*> StaticMeshes, TMap<FName, UMaterialInterface*>& OriginalPathsToMaterial, const FExportSettings& ExportSettings);
+	static void ExportMeshes(const TArrayView<UStaticMesh*> StaticMeshes, const FString& ExportDirectory, FUnrealToUnityExporterImportDescriptor& ImportDescriptor, const FExportSettings& ExportSettings);
+	static void ExportMaterials(const TMap<FName, UMaterialInterface*>& OriginalPathsToMaterial, const FString& ExportDirectory, FUnrealToUnityExporterImportDescriptor& ImportDescriptor);
+	static void ExportTextures(const UMaterialInterface& MaterialInterface, const FString& ExportDirectory, const FString& ExportFolder, FUnrealToUnityExporterMaterialDescriptor& MaterialDescriptor);
+	static void RevertChanges(const TArrayView<UStaticMesh*> StaticMeshes, const TArrayView<UMaterialInterface*> MaterialInterfaces);
+	static FString SaveImportDescriptor(const FUnrealToUnityExporterImportDescriptor& ImportDescriptor, const FString& ExportDirectory);
+	static void SendUnityImportMessage(const FString& ImportDescriptorSavePath);
 };
