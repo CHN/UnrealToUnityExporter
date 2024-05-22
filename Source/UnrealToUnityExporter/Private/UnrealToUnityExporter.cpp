@@ -73,16 +73,16 @@ void FUnrealToUnityExporterModule::RunUnrealToUnityExporter(const FExportSetting
 	SlowTask.EnterProgressFrame(1.f, LOCTEXT("ExportMaterialsSlowTask", "Exporting materials"));
 	ExportMaterials(OriginalPathsToMaterialData, ExportDirectory, ImportDescriptor);
 
-	SlowTask.EnterProgressFrame(1.f, LOCTEXT("RevertMeshesSlowTask", "Reverting mesh changes"));
-	// TODO: Consider implement
-	//TArray<UMaterialInterface*> GeneratedMaterials;
-	//OriginalPathsToMaterialData.GenerateValueArray(GeneratedMaterials);
-	RevertChanges(StaticMeshes, {} /*GeneratedMaterials*/);
-
 	SlowTask.EnterProgressFrame(1.f, LOCTEXT("SaveImportDescriptorSlowTask", "Saving mesh import descriptor"));
 	const FString ImportDescriptorSavePath = SaveImportDescriptor(ImportDescriptor, ExportDirectory);
 
 	SendUnityImportMessage(ImportDescriptorSavePath);
+	
+	SlowTask.EnterProgressFrame(1.f, LOCTEXT("RevertMeshesSlowTask", "Reverting mesh changes"));
+    // TODO: Consider implement
+    //TArray<UMaterialInterface*> GeneratedMaterials;
+    //OriginalPathsToMaterialData.GenerateValueArray(GeneratedMaterials);
+    RevertChanges(StaticMeshes, {} /*GeneratedMaterials*/);
 }
 
 void FUnrealToUnityExporterModule::BakeOutStaticMeshes(const TArrayView<UStaticMesh*> StaticMeshes, TMap<FName, FUnrealToUnityExporterMaterialData>& OriginalPathsToMaterialData, const FExportSettings& ExportSettings)
@@ -252,42 +252,36 @@ void FUnrealToUnityExporterModule::ExportTextures(const UMaterialInterface& Mate
 	};
 	
 	const FString SwitchParameterPrefix = TEXT("Use");
+	const FString TextureParameterSuffix = TEXT("Texture");
 	
-	for (const FMaterialParameterInfo& SwitchParameterInfo : SwitchParameterInfos)
+	for (const FMaterialParameterInfo& TextureParameterInfo : TextureParameterInfos)
 	{
-		const FString SwitchParameterName = SwitchParameterInfo.Name.ToString();
-		
-		if (!SwitchParameterName.StartsWith(SwitchParameterPrefix))
-		{
-			continue;
-		}
-
 		FUnrealToUnityExporterTextureDescriptor TextureDescriptor;
-		TextureDescriptor.ParameterName = SwitchParameterName.RightChop(SwitchParameterPrefix.Len());
+		TextureDescriptor.ParameterName = TextureParameterInfo.Name.ToString().LeftChop(TextureParameterSuffix.Len());
+		const FString SwitchParameterName = SwitchParameterPrefix + TextureDescriptor.ParameterName;
 		
-		bool bSwitchValue;
-		FGuid DummyGuid;
-		TextureDescriptor.bUseTexture = MaterialInterface.GetStaticSwitchParameterValue(SwitchParameterInfo, bSwitchValue, DummyGuid, true /*bOveriddenOnly*/) && bSwitchValue;
+		if (const FMaterialParameterInfo* SwitchParameterInfo = FindMaterialParameterInfo(SwitchParameterInfos, SwitchParameterName))
+		{
+			bool bSwitchValue;
+			FGuid DummyGuid;
+			TextureDescriptor.bUseTexture = MaterialInterface.GetStaticSwitchParameterValue(*SwitchParameterInfo, bSwitchValue, DummyGuid, true /*bOveriddenOnly*/) && bSwitchValue;
+		}
+		else
+		{
+			UTexture* DummyTexture;
+			TextureDescriptor.bUseTexture = MaterialInterface.GetTextureParameterValue(TextureParameterInfo, DummyTexture, true /*bOveriddenOnly*/);
+		}
 
 		if (TextureDescriptor.bUseTexture)
 		{
-			const FString TextureParameterName = TextureDescriptor.ParameterName + TEXT("Texture");
-			const FMaterialParameterInfo* const TextureParameterInfo = FindMaterialParameterInfo(TextureParameterInfos, TextureParameterName);
-
-			if (!TextureParameterInfo)
-			{
-				UE_LOG(LogTemp, Error, TEXT("Parameter not found: %s"), *TextureParameterName);
-				continue;
-			}
-
 			UTexture* Texture;
-			if (MaterialInterface.GetTextureParameterValue(*TextureParameterInfo, Texture, true /*bOveriddenOnly*/))
+			if (MaterialInterface.GetTextureParameterValue(TextureParameterInfo, Texture, true /*bOveriddenOnly*/))
 			{
 				if (UTexture2D* Texture2D = Cast<UTexture2D>(Texture))
 				{
 					FImage OutImage;
 					Texture2D->Source.GetMipImage(OutImage, 0);
-					const FString TexturePath = ExportFolder / TextureParameterInfo->Name.ToString() + TEXT(".png");
+					const FString TexturePath = ExportFolder / TextureParameterInfo.Name.ToString() + TEXT(".png");
 					const FString ExportPath = ExportDirectory / TexturePath;
 				
 					if (FPaths::FileExists(ExportPath))
@@ -361,7 +355,6 @@ void FUnrealToUnityExporterModule::RevertChanges(const TArrayView<UStaticMesh*> 
 	});
 	
 	UPackageTools::ReloadPackages(PackagesToReload);
-	UPackageTools::UnloadPackages(PackagesToReload);
 }
 
 FString FUnrealToUnityExporterModule::SaveImportDescriptor(const FUnrealToUnityExporterImportDescriptor& ImportDescriptor, const FString& ExportDirectory)
