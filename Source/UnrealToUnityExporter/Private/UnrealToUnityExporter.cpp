@@ -119,6 +119,7 @@ void FUnrealToUnityExporterModule::BakeOutStaticMeshes(const TArrayView<UStaticM
 		MaterialOptions->Properties.Emplace(MP_Roughness);
 		MaterialOptions->Properties.Emplace(MP_Normal);
 		MaterialOptions->Properties.Emplace(MP_Opacity);
+		MaterialOptions->Properties.Emplace(MP_OpacityMask);
 		MaterialOptions->Properties.Emplace(MP_EmissiveColor);
 
 		{
