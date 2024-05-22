@@ -10,6 +10,14 @@
 
 #define LOCTEXT_NAMESPACE "UnrealToUnityExporter"
 
+namespace
+{
+	const TArray<FTopLevelAssetPath> SupportedTypes =
+	{
+		FTopLevelAssetPath(TEXT("/Script/Engine.StaticMesh"))
+	};
+}
+
 void SExportSettingsWindow::Construct(const FArguments& InArgs)
 {
 	OnExportSettingsDone = InArgs._OnExportSettingsDone;
@@ -286,6 +294,7 @@ TSharedRef<SWidget> SExportSettingsWindow::AddAssetsBySearchModeWidget()
 				
 				FARFilter Filter;
 				Filter.bIncludeOnlyOnDiskAssets = true;
+				Filter.ClassPaths = SupportedTypes;
 				
 				Algo::Transform(ObjectPathStrings, Filter.SoftObjectPaths, [] (const FString& ObjectPathString)
 				{
@@ -321,13 +330,115 @@ TSharedRef<SWidget> SExportSettingsWindow::AddAssetsBySearchModeWidget()
 
 TSharedRef<SWidget> SExportSettingsWindow::AddAssetsBySearchAndExcludingModeWidget()
 {
-	return SNew(SButton)
-		.Text(LOCTEXT("ExecuteAddSelectedAssets", "Add Selected Assets2"))
-		.OnClicked_Lambda([this]
-		{
-			AddSelectedAssets();
-			return FReply::Handled();
-		});
+	const TSharedRef<SMultiLineEditableTextBox> AssetFolderPathsEditableTextBox = SNew(SMultiLineEditableTextBox)
+		.AlwaysShowScrollbars(true)
+		.HintText(LOCTEXT("AssetFolderPathsEditableTextBoxHintText", "Add folder paths separated by new line"));
+
+	const TSharedRef<SMultiLineEditableTextBox> ExcludeStringsEditableTextBox = SNew(SMultiLineEditableTextBox)
+		.AlwaysShowScrollbars(true)
+		.HintText(LOCTEXT("ExcludeStringsEditableTextBoxHintText", "Add exclude strings separated by new line"));
+	
+	const TSharedRef<SMultiLineEditableTextBox> ExcludeAssetPathsEditableTextBox = SNew(SMultiLineEditableTextBox)
+		.AlwaysShowScrollbars(true)
+		.HintText(LOCTEXT("ExcludeAssetPathsEditableTextBoxHintText", "Add exclude asset paths separated by new line"));
+	
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.MaxHeight(300.f)
+		[
+			AssetFolderPathsEditableTextBox
+		]
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.MaxHeight(300.f)
+		[
+			ExcludeStringsEditableTextBox
+		]
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.MaxHeight(300.f)
+		[
+			ExcludeAssetPathsEditableTextBox
+		]
+		+ SVerticalBox::Slot()
+		[
+			SNew(SButton)
+			.Text(LOCTEXT("ExecuteAddAssetsBySearch", "Add Assets by Search"))
+			.OnClicked_Lambda([this, AssetFolderPathsEditableTextBox, ExcludeStringsEditableTextBox, ExcludeAssetPathsEditableTextBox]
+			{
+				TArray<FString> FolderPaths;
+				AssetFolderPathsEditableTextBox->GetText().ToString().ParseIntoArrayLines(FolderPaths);
+
+				TArray<FString> ExcludeStrings;
+				ExcludeStringsEditableTextBox->GetText().ToString().ParseIntoArrayLines(ExcludeStrings);
+
+				TArray<FString> ExcludeAssetPaths;
+				ExcludeAssetPathsEditableTextBox->GetText().ToString().ParseIntoArrayLines(ExcludeAssetPaths);
+				
+				FARFilter Filter;
+				Filter.bIncludeOnlyOnDiskAssets = true;
+				Filter.bRecursivePaths = true;
+				Filter.ClassPaths = SupportedTypes;
+				
+				Algo::Transform(FolderPaths, Filter.PackagePaths, [] (const FString& FolderPath)
+				{
+					return FName(FolderPath);
+				});
+
+				const IAssetRegistry& AssetRegistry = FModuleManager::Get().LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+				TArray<FAssetData> Assets;
+
+				TArray<FAssetData> ExcludeAssets;
+				FARFilter ExcludeAssetsFilter;
+				ExcludeAssetsFilter.bIncludeOnlyOnDiskAssets = true;
+				
+				Algo::Transform(ExcludeAssetPaths, ExcludeAssetsFilter.SoftObjectPaths, [] (const FString& AssetPath)
+				{
+					return FSoftObjectPath(AssetPath);
+				});
+
+				AssetRegistry.GetAssets(ExcludeAssetsFilter, ExcludeAssets);
+
+				ErrorCount += ExcludeAssetPaths.Num() - ExcludeAssets.Num();
+				
+				if (AssetRegistry.GetAssets(Filter, Assets))
+				{
+					Assets.SetNum(Algo::RemoveIf(Assets, [this, &ExcludeAssets] (const FAssetData& AssetData)
+					{
+						const int32 Index = ExcludeAssets.IndexOfByKey(AssetData);
+						
+						if (Index != INDEX_NONE)
+						{
+							ExcludeAssets.RemoveAt(Index);
+							return true;
+						}
+						
+						return false;
+					}));
+
+					ErrorCount += ExcludeAssets.Num();
+
+					Assets.SetNum(Algo::RemoveIf(Assets, [&ExcludeStrings] (const FAssetData& AssetData)
+					{
+						for (const FString& ExcludeString : ExcludeStrings)
+						{
+							if (AssetData.AssetName.ToString().Contains(ExcludeString))
+							{
+								return true;
+							}
+						}
+
+						return false;
+					}));
+					
+					AddAssetsToSelectedAssetsUnique(Assets);
+					SelectedAssetsListView->RebuildList();
+				}
+				
+				return FReply::Handled();
+			})
+		];
 }
 
 void SExportSettingsWindow::AddAssetsToSelectedAssetsUnique(const TArray<FAssetData>& Assets)

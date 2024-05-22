@@ -361,6 +361,7 @@ void FUnrealToUnityExporterModule::RevertChanges(const TArrayView<UStaticMesh*> 
 	});
 	
 	UPackageTools::ReloadPackages(PackagesToReload);
+	UPackageTools::UnloadPackages(PackagesToReload);
 }
 
 FString FUnrealToUnityExporterModule::SaveImportDescriptor(const FUnrealToUnityExporterImportDescriptor& ImportDescriptor, const FString& ExportDirectory)
